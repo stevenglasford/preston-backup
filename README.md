@@ -180,3 +180,121 @@ sudo tail -100 /var/log/server-backup.log
 /etc/cron.d/server-backup   # Cron schedule
 /var/log/server-backup.log  # Backup log
 ```
+-----
+
+## External Drive Setup (8TB)
+
+### 1. Mount the drive
+
+```bash
+sudo bash mount-drive.sh
+```
+
+This will:
+
+- Show all connected block devices so you can identify yours
+- Offer to create a partition and format as ext4 (or use an existing one)
+- Mount it at `/mnt/data` and add it to `/etc/fstab` (with `nofail` so the server still boots if it’s ever disconnected)
+- Create this directory layout:
+
+```
+/mnt/data/
+├── media/       — photos, videos, audio
+├── uploads/     — web app file uploads
+├── databases/   — database exports/dumps
+├── app-data/    — app-specific large data
+├── archives/    — archival/cold storage
+└── downloads/   — misc
+```
+
+### 2. Point large files at the drive
+
+For your Node.js app, set environment variables or config to use `/mnt/data/`:
+
+```bash
+# In your app's .env or PM2 ecosystem file:
+UPLOAD_DIR=/mnt/data/uploads
+MEDIA_DIR=/mnt/data/media
+```
+
+Or create symlinks from wherever your app currently writes large files:
+
+```bash
+# Example: move existing uploads to the drive and symlink back
+mv /var/www/uploads /mnt/data/uploads
+ln -s /mnt/data/uploads /var/www/uploads
+```
+
+### 3. Install the data backup job
+
+Copy `backup-data.sh` to `/opt/server-backup/` alongside the other scripts:
+
+```bash
+sudo cp backup-data.sh /opt/server-backup/
+sudo chmod 700 /opt/server-backup/backup-data.sh
+sudo touch /var/log/server-backup-data.log
+sudo chmod 640 /var/log/server-backup-data.log
+```
+
+Add a cron entry (runs at 4:00 AM — after the system backup):
+
+```bash
+sudo tee -a /etc/cron.d/server-backup <<'CRON'
+0 4 * * * root /opt/server-backup/backup-data.sh >> /var/log/server-backup-data.log 2>&1
+CRON
+```
+
+### 4. First backup — run it manually
+
+The first backup of a large drive will take hours or days depending on how much data you have and your upload speed. Run it manually in a tmux/screen session so it survives disconnects:
+
+```bash
+sudo apt install tmux   # if not installed
+tmux new -s databackup
+sudo /opt/server-backup/backup-data.sh
+# Ctrl+B then D to detach; tmux attach -t databackup to recheck
+```
+
+Watch progress:
+
+```bash
+sudo tail -f /var/log/server-backup-data.log
+```
+
+### Retention policy
+
+The data backup uses a lighter retention schedule to keep B2 costs reasonable:
+
+|Backup type   |Daily|Weekly|Monthly|
+|--------------|-----|------|-------|
+|System (`/`)  |7    |4     |3      |
+|External drive|3    |2     |2      |
+
+Adjust `KEEP_*` at the top of `backup-data.sh` to suit your needs.
+
+### Restoring data drive files
+
+Use `restore.sh` — it works for both system and data snapshots:
+
+```bash
+sudo /opt/server-backup/restore.sh
+# Choose option 1 to list snapshots — data backups are tagged "data-backup"
+# Choose option 4 to restore a specific folder
+```
+
+Or filter by tag manually:
+
+```bash
+restic snapshots --tag data-backup
+restic restore latest --tag data-backup --path /mnt/data/uploads --target /tmp/restore
+```
+
+### Cost estimate
+
+|Data on drive|B2 storage|Monthly cost|
+|-------------|----------|------------|
+|500 GB       |~500 GB   |~$3         |
+|2 TB         |~2 TB     |~$12        |
+|8 TB (full)  |~8 TB     |~$48        |
+
+With restic’s deduplication, storing 3 daily + 2 weekly + 2 monthly snapshots of mostly-unchanged data costs only slightly more than one full copy.
